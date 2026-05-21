@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -158,6 +159,10 @@ type stashModel struct {
 	// Tracks if docs were loaded
 	loaded bool
 
+	// Tree browser state — built once loading completes.
+	dirIndex   map[string][]treeEntry
+	currentDir string
+
 	// The master set of markdown documents we're working with.
 	markdowns []*markdown
 
@@ -175,6 +180,36 @@ type stashModel struct {
 
 func (m stashModel) loadingDone() bool {
 	return m.loaded
+}
+
+// currentEntries returns the entries for the directory currently being browsed,
+// filtered by the active search if one is set.
+func (m stashModel) currentEntries() []treeEntry {
+	if m.dirIndex == nil {
+		return nil
+	}
+	entries := m.dirIndex[m.currentDir]
+	if m.filterState == unfiltered || m.filterInput.Value() == "" {
+		return entries
+	}
+	val := strings.ToLower(m.filterInput.Value())
+	var filtered []treeEntry
+	for _, e := range entries {
+		if strings.Contains(strings.ToLower(e.name), val) {
+			filtered = append(filtered, e)
+		}
+	}
+	return filtered
+}
+
+// selectedEntry returns the currently highlighted tree entry.
+func (m stashModel) selectedEntry() *treeEntry {
+	entries := m.currentEntries()
+	i := m.paginator().Page*m.paginator().PerPage + m.cursor()
+	if i < 0 || len(entries) == 0 || i >= len(entries) {
+		return nil
+	}
+	return &entries[i]
 }
 
 func (m stashModel) currentSection() *section {
@@ -262,7 +297,7 @@ func (m *stashModel) updatePagination() {
 
 	m.paginator().PerPage = max(1, availableHeight/stashViewItemHeight)
 
-	if pages := len(m.getVisibleMarkdowns()); pages < 1 {
+	if pages := len(m.currentEntries()); pages < 1 {
 		m.paginator().SetTotalPages(1)
 	} else {
 		m.paginator().SetTotalPages(pages)
@@ -344,11 +379,11 @@ func (m *stashModel) moveCursorUp() {
 	// Go to previous page
 	m.paginator().PrevPage()
 
-	m.setCursor(m.paginator().ItemsOnPage(len(m.getVisibleMarkdowns())) - 1)
+	m.setCursor(m.paginator().ItemsOnPage(len(m.currentEntries())) - 1)
 }
 
 func (m *stashModel) moveCursorDown() {
-	itemsOnPage := m.paginator().ItemsOnPage(len(m.getVisibleMarkdowns()))
+	itemsOnPage := m.paginator().ItemsOnPage(len(m.currentEntries()))
 
 	m.setCursor(m.cursor() + 1)
 	if m.cursor() < itemsOnPage {
@@ -361,9 +396,6 @@ func (m *stashModel) moveCursorDown() {
 		return
 	}
 
-	// During filtering the cursor position can exceed the number of
-	// itemsOnPage. It's more intuitive to start the cursor at the
-	// topmost position when moving it down in this scenario.
 	if m.cursor() > itemsOnPage {
 		m.setCursor(0)
 		return
@@ -419,6 +451,10 @@ func (m stashModel) update(msg tea.Msg) (stashModel, tea.Cmd) {
 	case localFileSearchFinished:
 		// We're finished searching for local files
 		m.loaded = true
+		m.dirIndex = buildDirIndex(m.markdowns)
+		m.setCursor(0)
+		m.paginator().Page = 0
+		m.updatePagination()
 
 	case filteredMarkdownMsg:
 		m.filteredMarkdowns = msg
@@ -461,7 +497,7 @@ func (m stashModel) update(msg tea.Msg) (stashModel, tea.Cmd) {
 func (m *stashModel) handleDocumentBrowsing(msg tea.Msg) tea.Cmd {
 	var cmds []tea.Cmd
 
-	numDocs := len(m.getVisibleMarkdowns())
+	numDocs := len(m.currentEntries())
 
 	switch msg := msg.(type) {
 	// Handle keys
@@ -517,27 +553,54 @@ func (m *stashModel) handleDocumentBrowsing(msg tea.Msg) tea.Cmd {
 
 		// Edit document in EDITOR
 		case "e":
-			md := m.selectedMarkdown()
-
-			// In case no file is available
-			if md == nil {
+			entry := m.selectedEntry()
+			if entry == nil || entry.kind == entryDir {
 				return nil
 			}
+			return openEditor(entry.md.localPath, 0)
 
-			return openEditor(md.localPath, 0)
-
-		// Open document
-		case keyEnter:
+		// Navigate into directory or open document
+		case keyEnter, "l", "right":
 			m.hideStatusMessage()
 
 			if numDocs == 0 {
 				break
 			}
 
-			// Load the document from the server. We'll handle the message
-			// that comes back in the main update function.
-			md := m.selectedMarkdown()
-			cmds = append(cmds, m.openMarkdown(md))
+			entry := m.selectedEntry()
+			if entry == nil {
+				break
+			}
+			if entry.kind == entryDir {
+				if m.currentDir == "" {
+					m.currentDir = entry.name
+				} else {
+					m.currentDir = filepath.Join(m.currentDir, entry.name)
+				}
+				m.setCursor(0)
+				m.paginator().Page = 0
+				m.updatePagination()
+				if m.filterApplied() {
+					m.resetFiltering()
+				}
+			} else {
+				cmds = append(cmds, m.openMarkdown(entry.md))
+			}
+
+		// Go up one directory level
+		case "h", "left":
+			if m.currentDir != "" {
+				m.currentDir = filepath.Dir(m.currentDir)
+				if m.currentDir == "." {
+					m.currentDir = ""
+				}
+				m.setCursor(0)
+				m.paginator().Page = 0
+				m.updatePagination()
+				if m.filterApplied() {
+					m.resetFiltering()
+				}
+			}
 
 		// Filter your notes
 		case "/":
@@ -589,7 +652,7 @@ func (m *stashModel) handleDocumentBrowsing(msg tea.Msg) tea.Cmd {
 	}
 
 	// Keep the index in bounds when paginating
-	itemsOnPage := m.paginator().ItemsOnPage(len(m.getVisibleMarkdowns()))
+	itemsOnPage := m.paginator().ItemsOnPage(len(m.currentEntries()))
 	if m.cursor() > itemsOnPage-1 {
 		m.setCursor(max(0, itemsOnPage-1))
 	}
@@ -605,41 +668,27 @@ func (m *stashModel) handleFiltering(msg tea.Msg) tea.Cmd {
 	if msg, ok := msg.(tea.KeyMsg); ok { //nolint:nestif
 		switch msg.String() {
 		case keyEsc:
-			// Cancel filtering
 			m.resetFiltering()
 		case keyEnter, "tab", "shift+tab", "ctrl+k", "up", "ctrl+j", "down":
 			m.hideStatusMessage()
 
-			if len(m.markdowns) == 0 {
-				break
-			}
+			entries := m.currentEntries()
 
-			h := m.getVisibleMarkdowns()
-
-			// If we've filtered down to nothing, clear the filter
-			if len(h) == 0 {
+			if len(entries) == 0 {
 				m.viewState = stashStateReady
 				m.resetFiltering()
 				break
 			}
 
-			// When there's only one filtered markdown left we can just
-			// "open" it directly
-			if len(h) == 1 {
+			// When there's exactly one file result, open it directly.
+			if len(entries) == 1 && entries[0].kind == entryFile {
 				m.viewState = stashStateReady
 				m.resetFiltering()
-				cmds = append(cmds, m.openMarkdown(h[0]))
+				cmds = append(cmds, m.openMarkdown(entries[0].md))
 				break
 			}
-
-			// Add new section if it's not present
-			if m.sections[len(m.sections)-1].key != filterSection {
-				m.sections = append(m.sections, sections[filterSection])
-			}
-			m.sectionIndex = len(m.sections) - 1
 
 			m.filterInput.Blur()
-
 			m.filterState = filterApplied
 			if m.filterInput.Value() == "" {
 				m.resetFiltering()
@@ -654,14 +703,13 @@ func (m *stashModel) handleFiltering(msg tea.Msg) tea.Cmd {
 	m.filterInput = newFilterInputModel
 	cmds = append(cmds, inputCmd)
 
-	// If the filtering input has changed, request updated filtering
 	if newFilterVal != currentFilterVal {
-		cmds = append(cmds, filterMarkdowns(*m))
+		m.setCursor(0)
+		m.paginator().Page = 0
+		m.updatePagination()
 	}
 
-	// Update pagination
 	m.updatePagination()
-
 	return tea.Batch(cmds...)
 }
 
@@ -772,73 +820,50 @@ func (m stashModel) headerView() string {
 		return strings.Join(sections, dividerDot.String())
 	}
 
-	// Tabs
-	for i, v := range m.sections {
-		var s string
-
-		switch v.key {
-		case documentsSection:
-			s = fmt.Sprintf("%d documents", localCount)
-
-		case filterSection:
-			s = fmt.Sprintf("%d “%s”", len(m.filteredMarkdowns), m.filterInput.Value())
-		}
-
-		if m.sectionIndex == i && len(m.sections) > 1 {
-			s = selectedTabStyle.Render(s)
-		} else {
-			s = tabStyle.Render(s)
-		}
-		sections = append(sections, s)
+	// Show path breadcrumb or total document count at root.
+	var label string
+	if m.currentDir == "" {
+		label = fmt.Sprintf("%d documents", localCount)
+	} else {
+		label = "/" + m.currentDir
 	}
+	sections = append(sections, tabStyle.Render(label))
 
 	return strings.Join(sections, dividerBar.String())
 }
 
 func (m stashModel) populatedView() string {
-	mds := m.getVisibleMarkdowns()
+	entries := m.currentEntries()
 
 	var b strings.Builder
 
-	// Empty states
-	if len(mds) == 0 {
-		f := func(s string) {
-			b.WriteString("  " + grayFg(s))
+	if len(entries) == 0 {
+		if m.loadingDone() {
+			b.WriteString("  " + grayFg("No files found."))
+		} else {
+			b.WriteString("  " + grayFg("Looking for local files..."))
 		}
+		// pad remaining space
+		n := m.paginator().PerPage*stashViewItemHeight - (stashViewItemHeight - 1)
+		for i := 0; i < n; i++ {
+			fmt.Fprint(&b, "\n")
+		}
+		return b.String()
+	}
 
-		switch m.sections[m.sectionIndex].key {
-		case documentsSection:
-			if m.loadingDone() {
-				f("No files found.")
-			} else {
-				f("Looking for local files...")
-			}
-		case filterSection:
-			return ""
+	start, end := m.paginator().GetSliceBounds(len(entries))
+	page := entries[start:end]
+
+	for i, entry := range page {
+		treeEntryView(&b, m, i, entry)
+		if i != len(page)-1 {
+			fmt.Fprintf(&b, "\n\n")
 		}
 	}
 
-	if len(mds) > 0 {
-		start, end := m.paginator().GetSliceBounds(len(mds))
-		docs := mds[start:end]
-
-		for i, md := range docs {
-			stashItemView(&b, m, i, md)
-			if i != len(docs)-1 {
-				fmt.Fprintf(&b, "\n\n")
-			}
-		}
-	}
-
-	// If there aren't enough items to fill up this page (always the last page)
-	// then we need to add some newlines to fill up the space where stash items
-	// would have been.
-	itemsOnPage := m.paginator().ItemsOnPage(len(mds))
+	itemsOnPage := m.paginator().ItemsOnPage(len(entries))
 	if itemsOnPage < m.paginator().PerPage {
 		n := (m.paginator().PerPage - itemsOnPage) * stashViewItemHeight
-		if len(mds) == 0 {
-			n -= stashViewItemHeight - 1
-		}
 		for i := 0; i < n; i++ {
 			fmt.Fprint(&b, "\n")
 		}

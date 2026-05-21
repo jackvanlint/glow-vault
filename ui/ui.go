@@ -229,6 +229,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, cmd
 				}
 				m.stash.markdowns = nil
+				m.stash.dirIndex = nil
+				m.stash.currentDir = ""
 				return m, m.Init()
 			}
 

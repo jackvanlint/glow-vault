@@ -89,6 +89,46 @@ func stashItemView(b *strings.Builder, m stashModel, index int, md *markdown) {
 	}
 }
 
+func treeEntryView(b *strings.Builder, m stashModel, index int, entry treeEntry) {
+	var (
+		truncateTo = uint(m.common.width - stashViewHorizontalPadding*2) //nolint:gosec
+		gutter     string
+		title      string
+		sub        string
+	)
+
+	isSelected := index == m.cursor()
+
+	if entry.kind == entryDir {
+		name := truncate.StringWithTail(entry.name+"/", truncateTo, ellipsis)
+		if isSelected {
+			gutter = dullFuchsiaFg(verticalLine)
+			title = fuchsiaFg("  " + name)
+		} else {
+			gutter = " "
+			title = brightGrayFg("  " + name)
+		}
+		sub = ""
+	} else {
+		name := truncate.StringWithTail(entry.name, truncateTo, ellipsis)
+		date := entry.md.relativeTime()
+		filterVal := m.filterInput.Value()
+		if isSelected {
+			gutter = dullFuchsiaFg(verticalLine)
+			title = fuchsiaFg(name)
+			sub = dimFuchsiaFg(date)
+		} else {
+			gutter = " "
+			s := lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#1a1a1a", Dark: "#dddddd"})
+			title = styleFilteredText(name, filterVal, s, s.Underline(true))
+			sub = grayFg(date)
+		}
+	}
+
+	fmt.Fprintf(b, "%s %s\n", gutter, title)
+	fmt.Fprintf(b, "%s %s", gutter, sub)
+}
+
 func styleFilteredText(haystack, needles string, defaultStyle, matchedStyle lipgloss.Style) string {
 	b := strings.Builder{}
 

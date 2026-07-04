@@ -3,3 +3,4 @@ dist/
 .envrc
 completions/
 manpages/
+/glow-vault
